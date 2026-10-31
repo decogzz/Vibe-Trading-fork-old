@@ -21,6 +21,12 @@ def _json_error(error: str, *, error_type: str = "validation") -> str:
     )
 
 
+_STALE_GOAL_HINT = (
+    " Omit goal_id entirely to act on the session's current goal, or copy the "
+    "current goal_id exactly as a tool returned it; never invent or guess one."
+)
+
+
 def _coerce_string_list(value: Any) -> list[str]:
     """Coerce a JSON-schema array-or-string value to a string list."""
     if value is None:
@@ -143,6 +149,28 @@ class _GoalToolBase(BaseTool):
             self._event_callback(event_type, data)
         except Exception:
             return
+
+    def _stale_goal_error(self, exc: StaleGoalError, session_id: str | None) -> str:
+        """Return a stale-goal error that names the current goal and how to recover.
+
+        Small local models can misread a bare "goal is not available for this
+        session", invent a plausible goal_id, retry, and give up. Naming the
+        current goal_id and the omit-goal_id recovery rule lets the model fix
+        the call itself.
+        """
+        payload: dict[str, Any] = {
+            "status": "error",
+            "error_type": "stale_goal",
+            "error": f"{exc}{_STALE_GOAL_HINT}",
+        }
+        if session_id:
+            try:
+                current = self._store.get_current_snapshot(session_id)
+            except Exception:
+                current = None
+            if current is not None:
+                payload["current_goal_id"] = str(current["goal"]["goal_id"])
+        return json.dumps(payload, ensure_ascii=False)
 
 
 class StartResearchGoalTool(_GoalToolBase):
@@ -309,7 +337,7 @@ class UpdateResearchGoalStatusTool(_GoalToolBase):
                 self._emit("goal.updated", {"goal": updated["goal"], "snapshot": updated})
             return json.dumps({"status": "ok", "snapshot": updated}, ensure_ascii=False)
         except StaleGoalError as exc:
-            return _json_error(str(exc), error_type="stale_goal")
+            return self._stale_goal_error(exc, session_id)
         except (json.JSONDecodeError, TypeError, ValueError) as exc:
             return _json_error(str(exc))
 
@@ -378,7 +406,7 @@ class UpdateResearchGoalTool(_GoalToolBase):
                 self._emit("goal.updated", {"goal": updated["goal"], "snapshot": updated})
             return json.dumps({"status": "ok", "snapshot": updated}, ensure_ascii=False)
         except StaleGoalError as exc:
-            return _json_error(str(exc), error_type="stale_goal")
+            return self._stale_goal_error(exc, session_id)
         except (TypeError, ValueError) as exc:
             return _json_error(str(exc))
 
@@ -550,6 +578,6 @@ class AddGoalEvidenceTool(_GoalToolBase):
                 ensure_ascii=False,
             )
         except StaleGoalError as exc:
-            return _json_error(str(exc), error_type="stale_goal")
+            return self._stale_goal_error(exc, session_id)
         except (TypeError, ValueError) as exc:
             return _json_error(str(exc))
