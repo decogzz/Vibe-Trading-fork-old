@@ -28,16 +28,25 @@ import json
 from datetime import datetime, timedelta, timezone
 
 PROFILE_ID = "alpaca-paper-trade"
-# (loader symbol, alpaca order symbol)
+# (loader symbol, alpaca order symbol, is_crypto)
 WATCHLIST = (
-    ("BTC-USDT", "BTC/USD"),
-    ("AAPL.US", "AAPL"),
-    ("NVDA.US", "NVDA"),
-    ("SPY.US", "SPY"),
-    ("MSFT.US", "MSFT"),
+    ("BTC-USDT", "BTC/USD", True),
+    ("ETH-USDT", "ETH/USD", True),
+    ("SOL-USDT", "SOL/USD", True),
+    ("AAPL.US", "AAPL", False),
+    ("NVDA.US", "NVDA", False),
+    ("SPY.US", "SPY", False),
+    ("MSFT.US", "MSFT", False),
 )
 MAX_NOTIONAL_USD = 5000.0
 BARS = 120
+# Alpaca crypto rejects time_in_force="day" ("invalid crypto time_in_force");
+# stocks reject nothing we use, but GTC is safe for both.
+_CRYPTO_TIF = "gtc"
+
+
+def _tif(is_crypto: bool) -> str:
+    return _CRYPTO_TIF if is_crypto else "day"
 
 
 def _closes_from_market_data(payload: dict, loader_symbol: str) -> list[float]:
@@ -116,13 +125,22 @@ def _positions_reply() -> dict:
     return {"positions": reply.get("positions") or reply.get("data") or []}
 
 
+def _norm(symbol: str) -> str:
+    """Normalize an Alpaca symbol so ``BTC/USD`` == ``BTCUSD`` == ``btcusd``.
+
+    Alpaca returns crypto positions without the slash (``BTCUSD``) while
+    orders take the slashed form (``BTC/USD``).
+    """
+    return str(symbol or "").strip().upper().replace("/", "")
+
+
 def _held_map(positions_reply: dict) -> dict[str, float]:
     """Map normalized uppercase symbol -> held quantity."""
     held: dict[str, float] = {}
     for row in positions_reply.get("positions") or []:
         if not isinstance(row, dict):
             continue
-        symbol = str(row.get("symbol") or "").strip().upper()
+        symbol = _norm(row.get("symbol"))
         qty = row.get("quantity")
         if qty is None:
             qty = row.get("qty")
@@ -142,7 +160,7 @@ def _pending_symbols() -> set[str]:
     pending: set[str] = set()
     for row in reply.get("open_orders") or []:
         if isinstance(row, dict):
-            symbol = str(row.get("symbol") or "").strip().upper()
+            symbol = _norm(row.get("symbol"))
             if symbol:
                 pending.add(symbol)
     return pending
@@ -158,7 +176,7 @@ def run_paper_pass() -> None:
     pending = _pending_symbols()
 
     actions: list[dict] = []
-    for loader_symbol, order_symbol in WATCHLIST:
+    for loader_symbol, order_symbol, is_crypto in WATCHLIST:
         try:
             closes = _fetch_closes(loader_symbol)
         except Exception as exc:  # noqa: BLE001 - one symbol must not abort the pass
@@ -170,8 +188,10 @@ def run_paper_pass() -> None:
             actions.append({"symbol": loader_symbol, "action": "skip", "reason": "insufficient bars"})
             continue
         bullish = fast > slow
-        is_held = held.get(order_symbol, 0.0) > 0
-        is_pending = order_symbol in pending
+        key = _norm(order_symbol)
+        is_held = held.get(key, 0.0) > 0
+        is_pending = key in pending
+        tif = _tif(is_crypto)
         if bullish and not is_held and not is_pending:
             result = place_order(
                 order_symbol,
@@ -179,12 +199,12 @@ def run_paper_pass() -> None:
                 side="buy",
                 notional=MAX_NOTIONAL_USD,
                 order_type="market",
-                time_in_force="day",
+                time_in_force=tif,
                 session_id="scheduled-paper-pass",
             )
             actions.append({"symbol": order_symbol, "action": "buy", "fast": fast, "slow": slow, "result": result})
         elif not bullish and is_held and not is_pending:
-            qty = held.get(order_symbol, 0.0)
+            qty = held.get(key, 0.0)
             if qty > 0:
                 result = place_order(
                     order_symbol,
@@ -192,14 +212,14 @@ def run_paper_pass() -> None:
                     side="sell",
                     quantity=qty,
                     order_type="market",
-                    time_in_force="day",
+                    time_in_force=tif,
                     session_id="scheduled-paper-pass",
                 )
                 actions.append({"symbol": order_symbol, "action": "sell", "fast": fast, "slow": slow, "result": result})
             else:
                 actions.append({"symbol": order_symbol, "action": "skip", "reason": "held but no quantity"})
         else:
-            actions.append({"symbol": order_symbol, "action": "hold", "fast": fast, "slow": slow})
+            actions.append({"symbol": order_symbol, "action": "hold", "fast": fast, "slow": slow, "crypto": is_crypto})
 
     record = {
         "fired_at": datetime.now(timezone.utc).isoformat(),
