@@ -177,6 +177,22 @@ def _br_data_run_sync() -> None:
         raise RuntimeError(f"Brazilian dataset sync failed for: {', '.join(failed)}")
 
 
+def _paper_trade_run_pass() -> None:
+    """Run one deterministic SMA-crossover pass on the paper account.
+
+    Backs the ``paper_trade.run`` key (fork addition): a no-LLM autonomous
+    trading pass for local models that strain on the full eager tool schema.
+    Watchlist, notional cap, and profile are fixed in
+    :mod:`src.scheduling.paper_run`; orders go through the same gated
+    ``src.trading.service`` surface the agent tools use, so paper placement
+    stays on the broker sandbox and a live profile would still hit the
+    mandate gate.
+    """
+    from src.scheduling.paper_run import run_paper_pass
+
+    run_paper_pass()
+
+
 # ---------------------------------------------------------------------------
 # Production allowlist — the ONLY name→callable surface (module docstring).
 #
@@ -189,4 +205,5 @@ def _br_data_run_sync() -> None:
 _INTERNAL_CALLABLES: dict[str, InternalRunnable] = {
     "memory.consolidate": _memory_consolidate,
     "br_data.run_sync": _br_data_run_sync,
+    "paper_trade.run": _paper_trade_run_pass,
 }
