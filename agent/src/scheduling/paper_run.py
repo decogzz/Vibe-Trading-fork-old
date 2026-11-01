@@ -1,21 +1,31 @@
-"""Deterministic scheduled paper-trading pass (SMA crossover).
+"""Deterministic scheduled paper-trading pass (SMA crossover + crypto RSI).
 
 Backs the ``paper_trade.run`` registry key: a no-LLM alternative to
 prompt-dispatched autonomous trading for local models that strain on a
-large eager tool schema. The pass is a fixed pipeline:
+large eager tool schema.
 
-1. Read the selected paper connector's account and open positions.
-2. Pull daily closes per watchlist symbol through the repository loader
-   layer (``get_market_data`` tool — Yahoo for US equities, OKX for
-   crypto), NOT the broker's own bars feed.
-3. Compute SMA(20)/SMA(50) on completed daily bars.
-4. Buy a symbol on a bullish crossover when it is not already held; sell a
-   held symbol on a bearish crossover. At most one order per symbol per
-   firing, notional-capped.
-5. Append a one-line audit record to the runtime log.
+Per-asset rules (fixed here; callers cannot widen them):
 
-Symbol mapping: loaders serve ``BTC-USDT``; Alpaca trades crypto as
-``BTC/USD``. ``ALPACA_SYMBOL`` maps a watchlist entry to the order symbol.
+* Stocks/ETFs (market-hours assets): daily SMA(20)/SMA(50) crossover —
+  buy a bullish cross when unheld, sell a held symbol on a bearish cross.
+  Orders stay ``time_in_force="day"``.
+* Crypto (24/7 assets): 4H bars, six evaluation points per day instead of
+  one, so crosses are acted on within hours rather than at the next daily
+  fire. Two signals, one order per pass per symbol:
+  - SMA crossover: 4H SMA(30)/SMA(50) (~5d/8.3d) — same trend-following
+    rule, on a faster clock.
+  - RSI(14) mean-reversion on 4H closes: oversold (<=30) is a BUY even
+    inside a bearish trend — it buys short-term panic the SMA rule sits
+    out. There is no RSI SELL entry (no shorting); instead the bearish-SMA
+    sell is gated on RSI having normalized above 45, so an oversold entry
+    is never instantly churned back out while it is still washed out.
+* Crypto orders use ``time_in_force="gtc"`` (Alpaca rejects ``day`` for
+  crypto; run 2026-11-01: ``invalid crypto time_in_force``).
+
+Bars come from the repository loader layer (``get_market_data`` tool —
+Yahoo for US equities, OKX for crypto), NOT the broker's bars feed.
+``BTC-USDT`` loader data maps to the ``BTC/USD`` Alpaca order symbol, and
+held/pending lookups normalize slashes away (``BTC/USD`` == ``BTCUSD``).
 
 Safety: the service layer routes paper profiles straight to the broker
 sandbox; live profiles would still pass the mandate gate. The watchlist and
@@ -39,44 +49,35 @@ WATCHLIST = (
     ("MSFT.US", "MSFT", False),
 )
 MAX_NOTIONAL_USD = 5000.0
+# Stock daily SMA windows
+_SMA_FAST_STOCK = 20
+_SMA_SLOW_STOCK = 50
+# Crypto 4H SMA windows (~30 bars = 5 days, ~50 bars = 8.3 days)
+_SMA_FAST_CRYPTO = 30
+_SMA_SLOW_CRYPTO = 50
+_RSI_PERIOD = 14
+_RSI_BUY = 30.0   # oversold → buy trigger
+_RSI_EXIT = 45.0  # sell gate: a bearish SMA only sells once RSI is above this
+MAX_NOTIONAL_USD = 5000.0
 BARS = 120
 # Alpaca crypto rejects time_in_force="day" ("invalid crypto time_in_force");
 # stocks reject nothing we use, but GTC is safe for both.
 _CRYPTO_TIF = "gtc"
+# 4H bars needed: SMA(50) + RSI(14) warmup + headroom for trend checks
+_CRYPTO_LOOKBACK_DAYS = 30
 
 
 def _tif(is_crypto: bool) -> str:
     return _CRYPTO_TIF if is_crypto else "day"
 
 
-def _closes_from_market_data(payload: dict, loader_symbol: str) -> list[float]:
-    """Extract ascending daily closes for one symbol from a get_market_data reply.
+def _norm(symbol: str) -> str:
+    """Normalize an Alpaca symbol so ``BTC/USD`` == ``BTCUSD`` == ``btcusd``.
 
-    The tool returns rows keyed directly by the requested symbol:
-    ``{"AAPL.US": [{...close...}], "_provenance": {...}}``. On any error the
-    top level is ``{"ok": false, "error": ...}`` — the status check in
-    :func:`_fetch_closes` catches that first.
+    Alpaca returns crypto positions without the slash (``BTCUSD``) while
+    orders take the slashed form (``BTC/USD``).
     """
-    if payload.get("ok") is False or payload.get("error"):
-        raise RuntimeError(str(payload.get("error") or payload)[:200])
-    rows = payload.get(loader_symbol) or payload.get(loader_symbol.upper())
-    if rows is None:
-        # tolerate a nested {"data": {...}} wrapper if one ever appears
-        nested = payload.get("data")
-        if isinstance(nested, dict):
-            rows = nested.get(loader_symbol)
-    if not isinstance(rows, list):
-        return []
-    closes: list[float] = []
-    for row in rows:
-        if not isinstance(row, dict):
-            continue
-        value = row.get("close")
-        if value is None:
-            value = row.get("Close")
-        if isinstance(value, (int, float)):
-            closes.append(float(value))
-    return closes
+    return str(symbol or "").strip().upper().replace("/", "")
 
 
 def _sma(values: list[float], period: int) -> float | None:
@@ -86,22 +87,51 @@ def _sma(values: list[float], period: int) -> float | None:
     return sum(window) / period
 
 
-def _fetch_closes(loader_symbol: str) -> list[float]:
-    """Fetch ~120 daily closes for one symbol through the loader layer."""
+def _rsi(closes: list[float], period: int = _RSI_PERIOD) -> float | None:
+    """Wilder RSI on a plain close list (causal, no future bars)."""
+    if len(closes) < period + 1:
+        return None
+    deltas = [closes[i] - closes[i - 1] for i in range(1, len(closes))]
+    gains = [max(d, 0.0) for d in deltas]
+    losses = [max(-d, 0.0) for d in deltas]
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period
+    for gain, loss in zip(gains[period:], losses[period:]):
+        avg_gain = (avg_gain * (period - 1) + gain) / period
+        avg_loss = (avg_loss * (period - 1) + loss) / period
+    if avg_loss == 0:
+        return 100.0 if avg_gain > 0 else 50.0
+    rs = avg_gain / avg_loss
+    return 100 - 100 / (1 + rs)
+
+
+def _load_rows(loader_symbol: str, interval: str, lookback_days: int) -> list[dict]:
+    """Fetch chronological OHLCV rows through the repository loader layer."""
     from src.tools.market_data_tool import MarketDataTool
 
     end = datetime.now(timezone.utc).date()
-    start = end - timedelta(days=BARS + 40)  # buffer for weekends/holidays
+    start = end - timedelta(days=lookback_days)
     reply = MarketDataTool().execute(
         codes=[loader_symbol],
         start_date=start.isoformat(),
         end_date=end.isoformat(),
         source="auto",
-        interval="1D",
+        interval=interval,
         max_rows=0,
     )
     payload = json.loads(reply)
-    return _closes_from_market_data(payload, loader_symbol)
+    if payload.get("ok") is False or payload.get("error"):
+        raise RuntimeError(str(payload.get("error") or payload)[:200])
+    rows = payload.get(loader_symbol) or payload.get(loader_symbol.upper())
+    if not isinstance(rows, list):
+        return []
+    return [row for row in rows if isinstance(row, dict) and isinstance(row.get("close"), (int, float))]
+
+
+def _fetch_closes(loader_symbol: str, interval: str = "1D", lookback_days: int = BARS + 40) -> list[float]:
+    """Fetch chronological daily closes for one symbol through the loader layer."""
+    rows = _load_rows(loader_symbol, interval, lookback_days)
+    return [float(row["close"]) for row in rows]
 
 
 def _account_equity() -> float | None:
@@ -123,15 +153,6 @@ def _positions_reply() -> dict:
     if isinstance(reply.get("positions"), list):
         return reply
     return {"positions": reply.get("positions") or reply.get("data") or []}
-
-
-def _norm(symbol: str) -> str:
-    """Normalize an Alpaca symbol so ``BTC/USD`` == ``BTCUSD`` == ``btcusd``.
-
-    Alpaca returns crypto positions without the slash (``BTCUSD``) while
-    orders take the slashed form (``BTC/USD``).
-    """
-    return str(symbol or "").strip().upper().replace("/", "")
 
 
 def _held_map(positions_reply: dict) -> dict[str, float]:
@@ -166,8 +187,48 @@ def _pending_symbols() -> set[str]:
     return pending
 
 
+def _decide_stock(closes: list[float]) -> dict:
+    """Daily SMA(20)/SMA(50) crossover decision for a market-hours symbol."""
+    fast = _sma(closes, _SMA_FAST_STOCK)
+    slow = _sma(closes, _SMA_SLOW_STOCK)
+    if fast is None or slow is None:
+        return {"action": "skip", "reason": "insufficient bars"}
+    bullish = fast > slow
+    return {"action": "hold", "bullish": bullish, "fast": fast, "slow": slow}
+
+
+def _decide_crypto(closes: list[float]) -> dict:
+    """4H dual-signal decision for a 24/7 symbol.
+
+    SMA(30)/SMA(50) on 4H bars plus RSI(14) mean-reversion. Returns the
+    decision dict; ``signal`` names the rule that fired, so the audit log
+    shows which path acted.
+    """
+    fast = _sma(closes, _SMA_FAST_CRYPTO)
+    slow = _sma(closes, _SMA_SLOW_CRYPTO)
+    if fast is None or slow is None:
+        return {"action": "skip", "reason": "insufficient bars"}
+    rsi = _rsi(closes)
+    if rsi is None:
+        return {"action": "skip", "reason": "insufficient bars for RSI"}
+    bullish = fast > slow
+    # RSI oversold is the only in-downtrend entry: it buys against short-term
+    # panic. Overbought is NOT an entry (shorting is out of scope); a held
+    # position is only sold by the bearish-SMA rule once RSI has normalized
+    # above _RSI_EXIT, so an oversold entry is never instantly churned back
+    # out while it is still oversold.
+    if rsi <= _RSI_BUY:
+        return {"action": "hold", "bullish": True, "signal": "rsi_oversold", "rsi": rsi, "fast": fast, "slow": slow}
+    if bullish:
+        return {"action": "hold", "bullish": True, "signal": "sma_bullish", "rsi": rsi, "fast": fast, "slow": slow}
+    if rsi < _RSI_EXIT:
+        # Still washed-out momentum: stand aside whether held or not.
+        return {"action": "hold", "bullish": True, "signal": "rsi_below_exit", "rsi": rsi, "fast": fast, "slow": slow}
+    return {"action": "hold", "bullish": False, "signal": "sma_bearish", "rsi": rsi, "fast": fast, "slow": slow}
+
+
 def run_paper_pass() -> None:
-    """Execute one scheduled SMA-crossover pass on the paper account."""
+    """Execute one scheduled pass on the paper account."""
     from src.trading.service import place_order
 
     equity_before = _account_equity()
@@ -177,21 +238,27 @@ def run_paper_pass() -> None:
 
     actions: list[dict] = []
     for loader_symbol, order_symbol, is_crypto in WATCHLIST:
-        try:
-            closes = _fetch_closes(loader_symbol)
-        except Exception as exc:  # noqa: BLE001 - one symbol must not abort the pass
-            actions.append({"symbol": loader_symbol, "action": "skip", "reason": f"history error: {exc}"})
-            continue
-        fast = _sma(closes, 20)
-        slow = _sma(closes, 50)
-        if fast is None or slow is None:
-            actions.append({"symbol": loader_symbol, "action": "skip", "reason": "insufficient bars"})
-            continue
-        bullish = fast > slow
         key = _norm(order_symbol)
+        tif = _tif(is_crypto)
+        try:
+            if is_crypto:
+                closes = _fetch_closes(loader_symbol, interval="4H", lookback_days=_CRYPTO_LOOKBACK_DAYS)
+                decision = _decide_crypto(closes)
+            else:
+                closes = _fetch_closes(loader_symbol)
+                decision = _decide_stock(closes)
+        except Exception as exc:  # noqa: BLE001 - one symbol must not abort the pass
+            actions.append({"symbol": order_symbol, "action": "skip", "reason": f"history error: {exc}"})
+            continue
+        if decision.get("action") == "skip":
+            actions.append({"symbol": order_symbol, "crypto": is_crypto, **decision})
+            continue
+
+        bullish = bool(decision.get("bullish"))
         is_held = held.get(key, 0.0) > 0
         is_pending = key in pending
-        tif = _tif(is_crypto)
+        entry = {"symbol": order_symbol, "crypto": is_crypto, **decision}
+
         if bullish and not is_held and not is_pending:
             result = place_order(
                 order_symbol,
@@ -202,7 +269,7 @@ def run_paper_pass() -> None:
                 time_in_force=tif,
                 session_id="scheduled-paper-pass",
             )
-            actions.append({"symbol": order_symbol, "action": "buy", "fast": fast, "slow": slow, "result": result})
+            actions.append({**entry, "action": "buy", "result": result})
         elif not bullish and is_held and not is_pending:
             qty = held.get(key, 0.0)
             if qty > 0:
@@ -215,11 +282,11 @@ def run_paper_pass() -> None:
                     time_in_force=tif,
                     session_id="scheduled-paper-pass",
                 )
-                actions.append({"symbol": order_symbol, "action": "sell", "fast": fast, "slow": slow, "result": result})
+                actions.append({**entry, "action": "sell", "result": result})
             else:
-                actions.append({"symbol": order_symbol, "action": "skip", "reason": "held but no quantity"})
+                actions.append({**entry, "action": "skip", "reason": "held but no quantity"})
         else:
-            actions.append({"symbol": order_symbol, "action": "hold", "fast": fast, "slow": slow, "crypto": is_crypto})
+            actions.append({**entry, "action": "hold"})
 
     record = {
         "fired_at": datetime.now(timezone.utc).isoformat(),
