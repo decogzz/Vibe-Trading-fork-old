@@ -1011,6 +1011,14 @@ def _bench_one_alpha(
     ic_std = float(ic_series.std())
     ir = ic_mean / ic_std if ic_std > 0 else 0.0
     ic_pos = float((ic_series > 0).mean())
+    # Per-alpha one-sample t-stat against zero — the input to the BH FDR
+    # annotation added at the bench level (see run_alpha_bench).
+    n_ic = int(len(ic_series))
+    t_val = (
+        float(ic_mean / (ic_std / (n_ic**0.5)))
+        if ic_std > 0 and n_ic >= 2
+        else 0.0
+    )
     alpha = registry.get(alpha_id)
     meta = alpha.meta or {}
     return {
@@ -1022,7 +1030,8 @@ def _bench_one_alpha(
         "ic_std": round(ic_std, 6),
         "ir": round(ir, 4),
         "ic_positive_ratio": round(ic_pos, 4),
-        "ic_count": int(len(ic_series)),
+        "t_stat": round(t_val, 4),
+        "ic_count": n_ic,
     }
 
 
@@ -1073,6 +1082,7 @@ _JINJA_TEMPLATE = """<!doctype html>
 <div class="meta">
   Generated {{ generated_at }} &middot; Universe {{ universe }} &middot;
   Period {{ period }} &middot; {{ n_alphas_tested }} tested, {{ n_skipped }} skipped
+  {% if n_fdr_discoveries is defined %}&middot; BH FDR 5%: {{ n_fdr_discoveries }} discovered{% endif %}
 </div>
 {% if meta and meta.survivorship_bias %}
 <div class="bias-warning">
@@ -1173,6 +1183,7 @@ def _render_html_manual(ctx: dict[str, Any]) -> str:
         " &middot; Period ",
         _esc(ctx["period"]),
         f" &middot; {int(ctx['n_alphas_tested'])} tested, {int(ctx['n_skipped'])} skipped",
+        f" &middot; BH FDR 5%: {int(ctx.get('n_fdr_discoveries') or 0)} discovered",
         "</div>",
     ]
     _meta = ctx.get("meta") or {}
@@ -1394,6 +1405,46 @@ def run_alpha_bench(**kwargs: Any) -> dict[str, Any]:
     results.sort(key=lambda r: r["ir"], reverse=True)
     top = results[:top_n]
 
+    # ── Benjamini-Hochberg FDR control (QuantDinger Factor Lab pattern) ──
+    # Bench N alphas over one history and the per-alpha t-stats answer
+    # "is this one real" at their face level; across N simultaneous tests the
+    # expected false discoveries scale with N. Annotate every row with its
+    # BH-adjusted q-value and a discovery flag so "which of these are real"
+    # is answerable, not just "is the best one real".
+    n_fdr_discovered = 0
+    try:
+        from scipy.stats import t as _student_t
+
+        from src.quantlib.multipletesting import benjamini_hochberg
+
+        p_values: list[float] = []
+        for row in results:
+            t_val = row.get("t_stat")
+            n_obs = row.get("ic_count")
+            if (
+                not isinstance(t_val, (int, float))
+                or not isinstance(n_obs, (int, float))
+                or n_obs < 2
+            ):
+                p_values.append(1.0)
+            else:
+                p_values.append(
+                    float(
+                        2.0
+                        * (1.0 - _student_t.cdf(abs(float(t_val)), df=int(n_obs) - 1))
+                    )
+                )
+        fdr = benjamini_hochberg(p_values, fdr=0.05)
+        n_fdr_discovered = int(fdr.n_rejected)
+        for row, p_val, adjusted, rejected in zip(
+            results, p_values, fdr.adjusted_p_values, fdr.rejected, strict=True
+        ):
+            row["p_value"] = round(float(p_val), 6)
+            row["bh_q_value"] = round(float(adjusted), 6)
+            row["bh_discovery"] = bool(rejected)
+    except Exception:  # noqa: BLE001 — FDR annotation is additive metadata
+        logger.debug("alpha_bench: BH annotation skipped", exc_info=True)
+
     output_dir.mkdir(parents=True, exist_ok=True)
     ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     report_path = output_dir / f"alpha_bench_{ts}_{secrets.token_hex(16)}.html"
@@ -1435,6 +1486,7 @@ def run_alpha_bench(**kwargs: Any) -> dict[str, Any]:
         "period": period,
         "n_alphas_tested": len(results),
         "n_skipped": len(failures),
+        "n_fdr_discoveries": n_fdr_discovered,
         "top": top,
         "failures": failures[:10],
         "meta": universe_meta,
@@ -1454,6 +1506,7 @@ def run_alpha_bench(**kwargs: Any) -> dict[str, Any]:
         "report_path": str(report_path),
         "n_alphas_tested": len(results),
         "n_skipped": len(failures),
+        "n_fdr_discoveries": n_fdr_discovered,
         "horizon": horizon,
         "forward_return_sampling": "non_overlapping" if horizon > 1 else "daily",
         "top": top,

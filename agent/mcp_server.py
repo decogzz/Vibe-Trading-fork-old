@@ -855,6 +855,326 @@ def backtest(run_dir: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Bounded async job model (QuantDinger-style submit / poll / cancel).
+# Every mutating job tool takes a caller-generated ``idempotency_key``;
+# retries with the same key return the same job instead of re-running.
+# ---------------------------------------------------------------------------
+
+_job_store_singleton = None
+
+
+def _get_job_store():
+    """Lazily build the process-wide JobStore under the runtime root."""
+    global _job_store_singleton
+    if _job_store_singleton is None:
+        from src.config.paths import get_runtime_root
+        from src.tools.job_model import JobStore
+
+        _job_store_singleton = JobStore(Path(get_runtime_root()) / "agent")
+    return _job_store_singleton
+
+
+@mcp.tool
+def submit_backtest(
+    run_dir: str,
+    idempotency_key: str,
+) -> str:
+    """Submit a backtest as a bounded async job instead of blocking.
+
+    Same contract as ``backtest`` (run_dir must contain config.json and
+    code/signal_engine.py) but returns immediately with a job envelope:
+    ``job_id``, ``status`` (pending/running/completed/error/cancelled),
+    ``submitted_at``. Poll with ``wait_for_job`` or ``get_job``; read the
+    full result from ``result_preview`` once completed, or from the run
+    artifacts it names.
+
+    Idempotent: re-submitting with the same ``idempotency_key`` returns the
+    original job without starting new work.
+
+    Args:
+        run_dir: Path to the run directory containing config.json and code/.
+        idempotency_key: Caller-generated unique key for this submission.
+            Retries of the same request MUST reuse the same key.
+    """
+    import os
+
+    from src.tools.backtest_tool import run_backtest
+    from src.tools.job_model import JobError, job_snapshot_envelope
+
+    store = _get_job_store()
+    try:
+        snapshot = store.submit(
+            kind="backtest",
+            idempotency_key=idempotency_key,
+            request={"run_dir": run_dir},
+            work=lambda: run_backtest(run_dir),
+            pid=os.getpid(),
+        )
+    except JobError as exc:
+        return _json_error(str(exc), error_type="validation")
+    return job_snapshot_envelope(snapshot)
+
+
+@mcp.tool
+def get_job(job_id: str) -> str:
+    """Read one job's status snapshot without blocking."""
+    from src.tools.job_model import JobError, job_snapshot_envelope
+
+    store = _get_job_store()
+    try:
+        snapshot = store.get(job_id)
+    except JobError as exc:
+        return _json_error(str(exc), error_type="not_found")
+    return job_snapshot_envelope(snapshot)
+
+
+@mcp.tool
+def list_jobs(limit: int = 50) -> str:
+    """List recent jobs (newest first), each as a public snapshot."""
+    from src.tools.job_model import job_snapshot_envelope
+
+    store = _get_job_store()
+    return json.dumps(
+        {"status": "ok", "jobs": store.list(limit=limit)}, ensure_ascii=False, indent=2
+    )
+
+
+@mcp.tool
+def wait_for_job(job_id: str, timeout_s: int = 300) -> str:
+    """Block until a job reaches a terminal status or the timeout expires.
+
+    Returns the job snapshot; ``timed_out: true`` on the snapshot means it
+    is still running — call again or switch to ``get_job`` polling.
+    """
+    import time as _time
+
+    from src.tools.job_model import JobError, job_snapshot_envelope
+
+    store = _get_job_store()
+    deadline = _time.monotonic() + max(1, int(timeout_s))
+    while True:
+        try:
+            snapshot = store.get(job_id)
+        except JobError as exc:
+            return _json_error(str(exc), error_type="not_found")
+        if snapshot.get("status") in ("completed", "error", "cancelled"):
+            return job_snapshot_envelope(snapshot)
+        if _time.monotonic() >= deadline:
+            snapshot = dict(snapshot)
+            snapshot["timed_out"] = True
+            return job_snapshot_envelope(snapshot)
+        _time.sleep(1.0)
+
+
+@mcp.tool
+def cancel_job(job_id: str, confirm_cancel: bool = False) -> str:
+    """Request cancellation of a running job. Requires explicit confirmation.
+
+    Cancellation is cooperative: the job stops at its next checkpoint. A
+    job already in a terminal status is returned unchanged.
+    """
+    from src.tools.job_model import JobError, job_snapshot_envelope
+
+    if not confirm_cancel:
+        return _json_error(
+            "cancel_job requires confirm_cancel=true",
+            error_type="confirmation_required",
+        )
+    store = _get_job_store()
+    try:
+        snapshot = store.cancel(job_id, confirm_cancel=True)
+    except JobError as exc:
+        return _json_error(str(exc), error_type="not_found")
+    return job_snapshot_envelope(snapshot)
+
+
+# ---------------------------------------------------------------------------
+# Compiled strategy manifests (QuantDinger Strategy API V2 pattern).
+# compile → save → list/get → backtest_from_manifest.
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool
+def compile_strategy(
+    run_dir: str,
+    name: str = "",
+    strategy_id: str = "",
+) -> str:
+    """Compile a strategy run directory into a canonical manifest.
+
+    The run_dir must contain ``config.json`` and ``code/signal_engine.py``
+    (the same contract ``backtest`` uses). The manifest owns the universe
+    (source/codes/market), period, risk policy (short/leverage/capital),
+    engine, warmup estimate, and a SHA-256 content hash of both inputs —
+    so a manifest is a verifiable, versioned identity for the strategy.
+
+    Returns the manifest; pass ``save_strategy_manifest`` to persist it.
+
+    Args:
+        run_dir: Path to the run directory containing config.json and code/.
+        name: Optional display name; defaults to the directory name.
+        strategy_id: Optional caller correlation id.
+    """
+    from src.tools.strategy_manifest import ManifestError, compile_strategy as _compile
+
+    try:
+        manifest = _compile(run_dir=run_dir, name=name, strategy_id=strategy_id)
+    except ManifestError as exc:
+        return _json_error(str(exc), error_type="validation")
+    return json.dumps(
+        {"status": "ok", "manifest": manifest}, ensure_ascii=False, indent=2
+    )
+
+
+@mcp.tool
+def save_strategy_manifest(
+    run_dir: str,
+    name: str = "",
+    strategy_id: str = "",
+    idempotency_key: str = "",
+) -> str:
+    """Compile and persist a strategy manifest to the durable registry.
+
+    Content-addressed: the same inputs always produce the same
+    ``manifest_id``, so re-saving is naturally idempotent without needing a
+    separate key. Pass ``idempotency_key`` for caller-side correlation in
+    the manifest record.
+
+    Args:
+        run_dir: Path to the run directory containing config.json and code/.
+        name: Optional display name.
+        strategy_id: Optional caller correlation id.
+        idempotency_key: Optional caller key recorded in the manifest.
+    """
+    from src.tools.strategy_manifest import (
+        ManifestError,
+        compile_strategy as _compile,
+        get_manifest_store,
+    )
+
+    try:
+        manifest = _compile(run_dir=run_dir, name=name, strategy_id=strategy_id)
+        if idempotency_key:
+            manifest["idempotency_key"] = idempotency_key
+        store = get_manifest_store()
+        path = store.save(manifest)
+    except ManifestError as exc:
+        return _json_error(str(exc), error_type="validation")
+    return json.dumps(
+        {
+            "status": "ok",
+            "manifest_id": manifest["manifest_id"],
+            "saved_path": path,
+            "manifest": manifest,
+        },
+        ensure_ascii=False,
+        indent=2,
+    )
+
+
+@mcp.tool
+def list_strategy_manifests(limit: int = 100) -> str:
+    """List saved strategy manifests (newest first), without full payloads."""
+    from src.tools.strategy_manifest import get_manifest_store
+
+    store = get_manifest_store()
+    return json.dumps(
+        {"status": "ok", "manifests": store.list(limit=limit)},
+        ensure_ascii=False,
+        indent=2,
+    )
+
+
+@mcp.tool
+def get_strategy_manifest(manifest_id: str) -> str:
+    """Read one saved strategy manifest by id."""
+    from src.tools.strategy_manifest import ManifestError, get_manifest_store
+
+    store = get_manifest_store()
+    try:
+        manifest = store.get(manifest_id)
+    except ManifestError as exc:
+        return _json_error(str(exc), error_type="not_found")
+    return json.dumps(
+        {"status": "ok", "manifest": manifest}, ensure_ascii=False, indent=2
+    )
+
+
+@mcp.tool
+def backtest_from_manifest(manifest_id: str) -> str:
+    """Run the existing backtest engine against a saved manifest's run_dir.
+
+    Proves the manifest is executable, not decorative: the manifest is a
+    verifiable identity for a strategy, and this runs that strategy through
+    the unchanged ``backtest`` path.
+
+    Args:
+        manifest_id: Manifest id from ``save_strategy_manifest``.
+    """
+    from src.tools.strategy_manifest import ManifestError, get_manifest_store
+
+    store = get_manifest_store()
+    try:
+        manifest = store.get(manifest_id)
+    except ManifestError as exc:
+        return _json_error(str(exc), error_type="not_found")
+
+    run_dir = manifest.get("run_dir")
+    if not run_dir or not Path(run_dir).is_dir():
+        return _json_error(
+            f"manifest run_dir no longer exists: {run_dir}",
+            error_type="not_found",
+        )
+    from src.tools.backtest_tool import run_backtest
+
+    result = json.loads(run_backtest(run_dir))
+    if isinstance(result, dict) and result.get("status") == "ok":
+        result["manifest_id"] = manifest_id
+    return json.dumps(result, ensure_ascii=False)
+
+
+# ---------------------------------------------------------------------------
+# VT→QD bridge: compile a Vibe-Trading run directory into a QuantDinger
+# Strategy API V2 source (embeds the SignalEngine verbatim in a V2 shell).
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool
+def compile_vt_strategy_for_quantdinger(
+    run_dir: str,
+    name: str = "",
+    warmup: int = 0,
+) -> str:
+    """Translate a Vibe-Trading strategy into QuantDinger Strategy API V2 source.
+
+    Reads ``run_dir/config.json`` (codes, market, benchmark, warmup) and
+    ``run_dir/code/signal_engine.py`` (the ``SignalEngine`` class), and emits
+    a standalone Strategy API V2 source: ``initialize(context)`` declares the
+    QD-shaped static universe (``USStock:SPY`` / ``Crypto:BTC-USDT`` / ...) and
+    subscriptions; ``handle_data`` rebuilds the trailing data_map from QD
+    history and calls the embedded VT ``SignalEngine.generate()`` each bar,
+    translating its latest target weights into ``order_target_percent``.
+
+    The generated source is ready for QD's Strategy IDE, or their MCP
+    ``compile_strategy_code`` / ``save_strategy_source`` tools.
+
+    Args:
+        run_dir: VT run directory (config.json + code/signal_engine.py).
+        name: Optional strategy name; defaults to the directory name.
+        warmup: Optional override for the QD ``set_warmup`` bar count
+            (0 = estimate from the engine's rolling windows, floor 120).
+    """
+    from src.tools.qd_bridge import compile_vt_run_to_qd as _compile
+
+    result = _compile(
+        run_dir=run_dir,
+        name=name,
+        warmup=warmup if warmup and warmup > 0 else None,
+    )
+    return json.dumps(result, ensure_ascii=False, indent=2)
+
+
+# ---------------------------------------------------------------------------
 # Paper-trading step tool (pt-v1.1/pt-v1.2, VD-12 hand-written wrapper)
 # ---------------------------------------------------------------------------
 
